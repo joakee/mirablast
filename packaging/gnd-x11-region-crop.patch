@@ -18,19 +18,26 @@ or xfce4-display-settings, with no interruption to the session. Only the
 origin can move that way: the caps are negotiated once, so a region of a
 different size is refused rather than passed on as a corrupt stream.
 
-Two things make that safe in practice:
+Moving a display can also resize the X root window, and that needs three
+further things to stay usable:
 
-The poll compares against the element's live properties, not just the
-previous file contents, because ximagesrc resets its crop to the full
-screen whenever an X screen resize leaves the old crop overshooting the
-root window (gst_ximage_src_get_caps). Moving a display shrinks the root
-window often enough to hit that.
+ximagesrc resets its crop to the full screen whenever a resize leaves the
+old crop overshooting the root window (gst_ximage_src_get_caps), so the
+poll compares against the element's live properties, not just the previous
+file contents, and re-asserts the region when it sees that.
 
-The capture is also scaled to a fixed size before intervideosink, so what
+The capture is scaled to a fixed size before intervideosink, so what
 crosses the intervideosink/intervideosrc bridge never changes size. That
-pair negotiates caps once; letting the reset above change them wedges it,
-and the sink then shows black for the rest of the session while the
-stream keeps flowing.
+pair negotiates caps once, and letting the reset above change them wedges
+it: the stream keeps flowing at full bitrate while the sink shows black
+for the rest of the session.
+
+Even with both of those the pipeline does not fully recover -- the picture
+comes back but is unstable -- so a detected reset also tears the session
+down and re-connects to the same sink. The sink reports DISCONNECTED
+before its P2P group has finished going away and starting into that fails,
+so the reconnect waits for it to settle and retries a few times.
+$GND_X11_RECONNECT=0 disables it.
 
 XDamage is deliberately left at its default (enabled). Forcing it off
 here made the encoded stream flicker badly and smear the cursor on a real
@@ -48,10 +55,97 @@ disables it for anyone who wants to experiment.
  #include <glib/gi18n.h>
  #include <gst/base/base.h>
  #include <gst/gst.h>
-@@ -143,6 +145,194 @@ nd_window_screencast_get_source (NdWindow * self)
+@@ -58,6 +60,13 @@ struct _NdWindow
+ 
+   NdSink                *stream_sink;
+ 
++  /* Sink to re-connect to after the capture is lost to an X screen resize,
++   * and the timer driving that; see gnd_request_reconnect. */
++  NdSink                *reconnect_sink;
++  guint                  reconnect_id;
++  guint                  reconnect_wait;
++  guint                  reconnect_tries;
++
+   GPtrArray             *sink_property_bindings;
+ 
+   /* Template widgets */
+@@ -143,6 +152,280 @@ nd_window_screencast_get_source (NdWindow * self)
    return g_steal_pointer (&src);
  }
  
++static void nd_window_connect_to_sink (NdWindow *self, NdSink *sink);
++
++/* Re-connecting after the capture is lost.
++ *
++ * An X screen resize can make ximagesrc reset its crop, which changes the
++ * caps on the already-negotiated intervideosink/intervideosrc pair and leaves
++ * it wedged: the stream keeps flowing but the sink shows a broken or black
++ * picture. Scaling before the bridge keeps that from being fatal, but the
++ * pipeline does not fully recover on its own, so tear the session down and
++ * bring it back up against the same sink.
++ */
++static gboolean
++gnd_reconnect_cb (gpointer user_data)
++{
++  NdWindow *self = ND_WINDOW (user_data);
++  NdSinkState state;
++
++  if (self->stream_sink)
++    {
++      /* A failed attempt parks the sink in ERROR; drop it so it can reach
++       * DISCONNECTED and be started again. */
++      g_object_get (self->stream_sink, "state", &state, NULL);
++      if (state == ND_SINK_STATE_ERROR)
++        nd_sink_stop_stream (self->stream_sink);
++
++      return G_SOURCE_CONTINUE;
++    }
++
++  /* The sink reports DISCONNECTED before the P2P group has finished going
++   * away, and starting a new stream into that fails, so let it settle. */
++  if (self->reconnect_wait > 0)
++    {
++      self->reconnect_wait--;
++      return G_SOURCE_CONTINUE;
++    }
++
++  self->reconnect_id = 0;
++
++  if (!self->reconnect_sink)
++    return G_SOURCE_REMOVE;
++
++  g_message ("GND_X11_REGION_FILE: re-connecting after the capture was lost");
++  nd_window_connect_to_sink (self, self->reconnect_sink);
++
++  return G_SOURCE_REMOVE;
++}
++
++static void
++gnd_request_reconnect (NdWindow *self)
++{
++  if (!self)
++    return;
++
++  if (g_strcmp0 (g_getenv ("GND_X11_RECONNECT"), "0") == 0)
++    {
++      g_message ("GND_X11_RECONNECT=0: not re-connecting, the picture may stay broken");
++      return;
++    }
++
++  if (self->reconnect_id != 0)
++    return;                     /* already on its way */
++
++  if (!self->reconnect_sink || !self->stream_sink)
++    return;
++
++  g_message ("GND_X11_REGION_FILE: capture lost to an X screen resize, re-connecting");
++
++  self->reconnect_tries = 3;
++  self->reconnect_wait = 6;     /* seconds of settle after DISCONNECTED */
++  nd_sink_stop_stream (self->stream_sink);
++  self->reconnect_id = g_timeout_add_seconds (1, gnd_reconnect_cb, self);
++}
++
 +/* Parse "WxH+X+Y". Returns FALSE and leaves the outputs untouched if the
 + * string is not of that form or describes an empty region. */
 +static gboolean
@@ -119,6 +213,7 @@ disables it for anyone who wants to experiment.
 +gnd_region_file_poll (gpointer user_data)
 +{
 +  GstElement *src = GST_ELEMENT (user_data);
++  NdWindow *window = g_object_get_data (G_OBJECT (src), "gnd-region-window");
 +  const gchar *path = g_object_get_data (G_OBJECT (src), "gnd-region-path");
 +  guint exp_w = GPOINTER_TO_UINT (g_object_get_data (G_OBJECT (src), "gnd-region-w"));
 +  guint exp_h = GPOINTER_TO_UINT (g_object_get_data (G_OBJECT (src), "gnd-region-h"));
@@ -163,12 +258,20 @@ disables it for anyone who wants to experiment.
 +    return G_SOURCE_CONTINUE;
 +
 +  if (cur_endx - cur_x + 1 != exp_w || cur_endy - cur_y + 1 != exp_h)
-+    g_message ("GND_X11_REGION_FILE: capture was reset to %ux%u+%u+%u "
-+               "(X screen resize); restoring %ux%u+%u+%u",
-+               cur_endx - cur_x + 1, cur_endy - cur_y + 1, cur_x, cur_y, w, h, x, y);
-+  else
-+    g_message ("GND_X11_REGION_FILE: moving capture to +%u+%u", x, y);
++    {
++      g_message ("GND_X11_REGION_FILE: capture was reset to %ux%u+%u+%u "
++                 "(X screen resize); restoring %ux%u+%u+%u",
++                 cur_endx - cur_x + 1, cur_endy - cur_y + 1, cur_x, cur_y, w, h, x, y);
++      gnd_apply_region (src, w, h, x, y);
 +
++      /* Restoring the crop is not enough: the bridge downstream saw the size
++       * change and does not recover, so start a reconnect as well. */
++      gnd_request_reconnect (window);
++
++      return G_SOURCE_CONTINUE;
++    }
++
++  g_message ("GND_X11_REGION_FILE: moving capture to +%u+%u", x, y);
 +  gnd_apply_region (src, w, h, x, y);
 +
 +  return G_SOURCE_CONTINUE;
@@ -181,7 +284,7 @@ disables it for anyone who wants to experiment.
 +}
 +
 +static void
-+gnd_setup_x11_region (GstElement *src)
++gnd_setup_x11_region (GstElement *src, NdWindow *window)
 +{
 +  const gchar *region = g_getenv ("GND_X11_REGION");
 +  const gchar *region_file = g_getenv ("GND_X11_REGION_FILE");
@@ -215,6 +318,10 @@ disables it for anyone who wants to experiment.
 +      g_message ("GND_X11_REGION_FILE: tracking %s for repositioning", region_file);
 +      g_object_set_data_full (G_OBJECT (src), "gnd-region-path",
 +                              g_strdup (region_file), g_free);
++      /* Plain pointer: the window owns the pipeline this element lives in, and
++       * the pipeline is torn down when streaming stops, so src never outlives
++       * the window. */
++      g_object_set_data (G_OBJECT (src), "gnd-region-window", window);
 +      /* The negotiated size. Compared against the file rather than against
 +       * the element's current properties, which ximagesrc may have reset. */
 +      g_object_set_data (G_OBJECT (src), "gnd-region-w", GUINT_TO_POINTER (w));
@@ -243,19 +350,19 @@ disables it for anyone who wants to experiment.
  static GstElement *
  sink_create_source_cb (NdWindow * self, NdSink * sink)
  {
-@@ -153,7 +343,10 @@ sink_create_source_cb (NdWindow * self, NdSink * sink)
+@@ -153,7 +436,10 @@ sink_create_source_cb (NdWindow * self, NdSink * sink)
    bin = GST_BIN (gst_bin_new ("screencast source bin"));
    g_debug ("use x11: %d", self->use_x11);
    if (self->use_x11)
 -    src = gst_element_factory_make ("ximagesrc", "X11 screencast source");
 +    {
 +      src = gst_element_factory_make ("ximagesrc", "X11 screencast source");
-+      gnd_setup_x11_region (src);
++      gnd_setup_x11_region (src, self);
 +    }
    else
      src = nd_window_screencast_get_source (self);
  
-@@ -172,7 +365,46 @@ sink_create_source_cb (NdWindow * self, NdSink * sink)
+@@ -172,7 +458,46 @@ sink_create_source_cb (NdWindow * self, NdSink * sink)
                  NULL);
    gst_bin_add (bin, dst);
  
@@ -303,3 +410,53 @@ disables it for anyone who wants to experiment.
      {
        /* Initial caps for virtual display */
        caps = gst_caps_new_simple ("video/x-raw",
+@@ -280,6 +605,18 @@ sink_notify_state_cb (NdWindow *self, GParamSpec *pspec, NdSink *sink)
+       g_list_store_append (self->error_sink_list_model, self->stream_sink);
+ 
+       gtk_stack_set_visible_child_name (self->step_stack, "error");
++
++      /* A reconnect attempt that failed: back off and try again rather than
++       * leaving the session sitting on the error page. */
++      if (self->reconnect_tries > 0 && self->reconnect_id == 0)
++        {
++          self->reconnect_tries--;
++          self->reconnect_wait = 6;
++          g_message ("GND_X11_REGION_FILE: re-connect attempt failed, %u left",
++                     self->reconnect_tries);
++          nd_sink_stop_stream (self->stream_sink);
++          self->reconnect_id = g_timeout_add_seconds (1, gnd_reconnect_cb, self);
++        }
+       break;
+ 
+     case ND_SINK_STATE_DISCONNECTED:
+@@ -383,7 +720,6 @@ nd_screencast_init_cb (GObject      *source_object,
+ static void
+ find_sink_list_row_activated_cb (NdWindow *self, NdSinkRow *row, GtkListBox *sink_list)
+ {
+-  NdSink *sink;
+ 
+   if (!self->use_x11 && !self->portal)
+     {
+@@ -408,7 +744,12 @@ find_sink_list_row_activated_cb (NdWindow *self, NdSinkRow *row, GtkListBox *sin
+ 
+   g_assert (ND_IS_SINK_ROW (row));
+ 
+-  sink = nd_sink_row_get_sink (row);
++  nd_window_connect_to_sink (self, nd_sink_row_get_sink (row));
++}
++
++static void
++nd_window_connect_to_sink (NdWindow *self, NdSink *sink)
++{
+   self->stream_sink = nd_sink_start_stream (sink);
+ 
+   if (!self->stream_sink)
+@@ -465,6 +806,8 @@ find_sink_list_row_activated_cb (NdWindow *self, NdSinkRow *row, GtkListBox *sin
+ 
+   g_object_set (self->meta_provider, "discover", FALSE, NULL);
+   g_list_store_append (self->connect_sink_list_model, self->stream_sink);
++
++  g_set_object (&self->reconnect_sink, sink);
+ }
+ 
+ static void
