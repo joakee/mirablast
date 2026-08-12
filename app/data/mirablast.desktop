@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Mirablast
+Comment=Use a Miracast sink as a real extended display
+Exec=mirablast-app
+Icon=video-display
+Categories=Utility;
+StartupNotify=false
+X-GNOME-UsesNotifications=false
