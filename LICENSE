@@ -1,3 +1,11 @@
+This repository is licensed per directory:
+
+  - app/ is GPL-3.0-or-later (see app/LICENSE). It incorporates source code
+    from gnome-network-displays, which is GPL-3.0-or-later.
+  - Everything else (bin/, packaging/) is under the MIT License below.
+
+---
+
 MIT License
 
 Copyright (c) 2026 James Oakey

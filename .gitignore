@@ -4,3 +4,4 @@ packaging/pkg/
 packaging/gnome-network-displays/
 packaging/*.pkg.tar*
 packaging/.SRCINFO
+app/build/
