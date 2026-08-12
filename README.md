@@ -1,24 +1,27 @@
 # mirablast
 
-Turns a Miracast / Wi-Fi Display sink into a real **extended** monitor on
-XFCE/X11, instead of a mirror of your primary display.
+Utilise a miracast / P2P-Wi-Fi Display sink into a real extended monitor on
+X11! (currently targeting XFCE4)
 
-`gnome-network-displays` (gnd) already does Miracast well, but on a
+`gnome-network-displays` (gnd) can already handle Miracast, but on a
 non-GNOME/X11 session it falls back to capturing the whole root window with a
-bare `ximagesrc`, because the ScreenCast portal it normally uses for monitor
-selection requires Mutter. That fallback can only ever mirror.
+bare `ximagesrc`, since the screencast portal it uses for monitor
+selection requires Mutter, and the fallback can only ever mirror
 
 mirablast works around that with two independent pieces:
 
-1. A small patch set for gnd that lets it crop its X11 capture to an
-   arbitrary region (`$GND_X11_REGION`), plus two latency-related patches.
+1. a small patch set for gnd that lets it crop its X11 capture to an
+   arbitrary region (`$GND_X11_REGION`), and a few tweaks pertaining to latency
+
 2. `evdi-virtual-display`, which attaches a synthesised EDID to an
-   [evdi](https://github.com/DisplayLink/evdi) device, giving you a **real**
-   RandR output for any resolution/refresh rate you ask for. `xrandr
-   --setmonitor` was tried first and doesn't work for this: xfwm4 and the
-   XFCE/arandr tooling compute usable desktop space from RandR 1.2 *outputs*,
-   not RandR 1.5 *monitors*, and clamp windows to the physical panel edge if
-   you use it.
+   [evdi](https://github.com/DisplayLink/evdi) device, giving you a RandR output for a specified resolution and refresh rate
+
+   > [!note] 
+   > xfwm4 and the XFCE/arandr tooling compute usable desktop space from RandR 1.2 outputs,
+   > not RandR 1.5 , and clamp windows to the physical panel edge if
+   > you use it.
+   >
+   > 
 
 `miracast-extend` glues the two together: it brings up the virtual output
 positioned to the right of your primary display, then launches the patched
@@ -26,33 +29,68 @@ gnd pointed at just that region.
 
 ## Requirements
 
-- XFCE on X11 (developed and tested there; other RandR/xrandr-based X11
-  window managers likely work, but the display-profile handling below is
+- XFCE on X11 (developed and tested on XFCE, other RandR/xrandr-based X11
+  window managers might work, but the display-profile handling below is
   XFCE-specific)
+  
+  - Portability across X11 DEs/WMs will be likely be explored in the future
+  
 - The `evdi` kernel module, e.g. via `evdi-dkms`, and its `PyEvdi` Python
   bindings (ships alongside `evdi-dkms` on Arch)
-- A Miracast/WFD sink to cast to
+- A Miracast/WFD sink to cast to 
+
+  > Currently only being tested on an [HP Elite X3 Lapdock](https://support.hp.com/au-en/product/product-specs/hp-elite-x3-lap-dock/12088822)
 - For the packaged build: an Arch-family distro with `makepkg`. Elsewhere,
   apply `packaging/*.patch` to a `gnome-network-displays` checkout yourself
   and build with `meson` -- the patches are plain unified diffs against
   upstream `src/`, nothing Arch-specific is in them.
 
-## Install
+## Build & install
 
+No install script -- three independent pieces, none distro-specific to set up
+except the first, which has an Arch shortcut.
+
+**1. Patched `gnome-network-displays`**
+
+Arch-family, using the bundled PKGBUILD (prompts for your password to
+install):
 ```
-git clone <this repo> ~/Projects/mirablast
-cd ~/Projects/mirablast
-./install.sh
+cd packaging
+makepkg -si
 ```
 
-This symlinks `bin/evdi-virtual-display` and `bin/miracast-extend` into
-`~/.local/bin`, and on Arch, builds and installs the patched
-`gnome-network-displays-git` package via `makepkg -si` (which will prompt for
-your password to install it).
+Anywhere else, apply the patches to an upstream checkout and build with
+`meson` yourself -- this is exactly what the PKGBUILD's `prepare()`/`build()`
+do under the hood:
+```
+git clone https://gitlab.gnome.org/GNOME/gnome-network-displays.git
+cd gnome-network-displays
+patch -Np1 -i ../packaging/gnd-x11-region-crop.patch
+patch -Np1 -i ../packaging/gnd-gop-seconds.patch
+patch -Np1 -i ../packaging/gnd-latency.patch
+meson setup build --prefix=/usr/local
+meson compile -C build
+sudo meson install -C build
+```
+Check `packaging/PKGBUILD`'s `depends=()` for the library list to install
+first (GStreamer, GTK4, libadwaita, libnm, libportal, ...) -- package names
+vary by distro.
 
-If `evdi`/`PyEvdi` aren't set up yet, `install.sh` warns but doesn't fail --
-get those from your distro's `evdi-dkms` package (or build evdi from source)
-before trying to run anything.
+**2. `evdi` + `PyEvdi`**
+
+Get these from your distro, e.g. `evdi-dkms` on Arch. There's no portable
+package name to point at generally; check your distro's packaging of
+[evdi](https://github.com/DisplayLink/evdi).
+
+**3. The scripts themselves**
+
+`bin/evdi-virtual-display` and `bin/miracast-extend` are plain executables,
+no build step. Put them on your `$PATH` however you like, e.g.:
+```
+ln -s "$PWD/bin/"* ~/.local/bin/
+```
+They locate each other relative to their own path, so this works regardless
+of where you symlink them from.
 
 ## Usage
 
