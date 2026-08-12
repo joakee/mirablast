@@ -39,6 +39,11 @@ before its P2P group has finished going away and starting into that fails,
 so the reconnect waits for it to settle and retries a few times.
 $GND_X11_RECONNECT=0 disables it.
 
+The connect itself is handed to an idle rather than run from the timer:
+it repopulates the sink list models and switches stack pages, and doing
+that with GTK layout still pending crashes inside gtk_viewport_scroll_to
+after a few reconnects.
+
 XDamage is deliberately left at its default (enabled). Forcing it off
 here made the encoded stream flicker badly and smear the cursor on a real
 Miracast sink, while an identical uncropped capture was clean; the full
@@ -55,7 +60,7 @@ disables it for anyone who wants to experiment.
  #include <glib/gi18n.h>
  #include <gst/base/base.h>
  #include <gst/gst.h>
-@@ -58,6 +60,13 @@ struct _NdWindow
+@@ -58,6 +60,14 @@ struct _NdWindow
  
    NdSink                *stream_sink;
  
@@ -65,11 +70,12 @@ disables it for anyone who wants to experiment.
 +  guint                  reconnect_id;
 +  guint                  reconnect_wait;
 +  guint                  reconnect_tries;
++  guint                  reconnect_idle_id;
 +
    GPtrArray             *sink_property_bindings;
  
    /* Template widgets */
-@@ -143,6 +152,280 @@ nd_window_screencast_get_source (NdWindow * self)
+@@ -143,6 +153,303 @@ nd_window_screencast_get_source (NdWindow * self)
    return g_steal_pointer (&src);
  }
  
@@ -84,6 +90,22 @@ disables it for anyone who wants to experiment.
 + * pipeline does not fully recover on its own, so tear the session down and
 + * bring it back up against the same sink.
 + */
++static gboolean
++gnd_reconnect_idle_cb (gpointer user_data)
++{
++  NdWindow *self = ND_WINDOW (user_data);
++
++  self->reconnect_idle_id = 0;
++
++  if (!self->reconnect_sink || self->stream_sink)
++    return G_SOURCE_REMOVE;
++
++  g_message ("GND_X11_REGION_FILE: re-connecting after the capture was lost");
++  nd_window_connect_to_sink (self, self->reconnect_sink);
++
++  return G_SOURCE_REMOVE;
++}
++
 +static gboolean
 +gnd_reconnect_cb (gpointer user_data)
 +{
@@ -114,8 +136,15 @@ disables it for anyone who wants to experiment.
 +  if (!self->reconnect_sink)
 +    return G_SOURCE_REMOVE;
 +
-+  g_message ("GND_X11_REGION_FILE: re-connecting after the capture was lost");
-+  nd_window_connect_to_sink (self, self->reconnect_sink);
++  /* Connecting repopulates the sink list models and switches stack pages.
++   * Doing that straight from this timeout runs it while GTK still has layout
++   * pending -- it emits "snapshot without a current allocation" criticals and
++   * eventually crashes inside gtk_viewport_scroll_to. Hand it to an idle at
++   * the priority GTK uses for its own post-layout work instead. */
++  if (self->reconnect_idle_id == 0)
++    self->reconnect_idle_id = g_idle_add_full (G_PRIORITY_DEFAULT_IDLE,
++                                               gnd_reconnect_idle_cb,
++                                               self, NULL);
 +
 +  return G_SOURCE_REMOVE;
 +}
@@ -350,7 +379,7 @@ disables it for anyone who wants to experiment.
  static GstElement *
  sink_create_source_cb (NdWindow * self, NdSink * sink)
  {
-@@ -153,7 +436,10 @@ sink_create_source_cb (NdWindow * self, NdSink * sink)
+@@ -153,7 +460,10 @@ sink_create_source_cb (NdWindow * self, NdSink * sink)
    bin = GST_BIN (gst_bin_new ("screencast source bin"));
    g_debug ("use x11: %d", self->use_x11);
    if (self->use_x11)
@@ -362,7 +391,7 @@ disables it for anyone who wants to experiment.
    else
      src = nd_window_screencast_get_source (self);
  
-@@ -172,7 +458,46 @@ sink_create_source_cb (NdWindow * self, NdSink * sink)
+@@ -172,7 +482,46 @@ sink_create_source_cb (NdWindow * self, NdSink * sink)
                  NULL);
    gst_bin_add (bin, dst);
  
@@ -410,7 +439,7 @@ disables it for anyone who wants to experiment.
      {
        /* Initial caps for virtual display */
        caps = gst_caps_new_simple ("video/x-raw",
-@@ -280,6 +605,18 @@ sink_notify_state_cb (NdWindow *self, GParamSpec *pspec, NdSink *sink)
+@@ -280,6 +629,18 @@ sink_notify_state_cb (NdWindow *self, GParamSpec *pspec, NdSink *sink)
        g_list_store_append (self->error_sink_list_model, self->stream_sink);
  
        gtk_stack_set_visible_child_name (self->step_stack, "error");
@@ -429,7 +458,7 @@ disables it for anyone who wants to experiment.
        break;
  
      case ND_SINK_STATE_DISCONNECTED:
-@@ -383,7 +720,6 @@ nd_screencast_init_cb (GObject      *source_object,
+@@ -383,7 +744,6 @@ nd_screencast_init_cb (GObject      *source_object,
  static void
  find_sink_list_row_activated_cb (NdWindow *self, NdSinkRow *row, GtkListBox *sink_list)
  {
@@ -437,7 +466,7 @@ disables it for anyone who wants to experiment.
  
    if (!self->use_x11 && !self->portal)
      {
-@@ -408,7 +744,12 @@ find_sink_list_row_activated_cb (NdWindow *self, NdSinkRow *row, GtkListBox *sin
+@@ -408,7 +768,12 @@ find_sink_list_row_activated_cb (NdWindow *self, NdSinkRow *row, GtkListBox *sin
  
    g_assert (ND_IS_SINK_ROW (row));
  
@@ -451,7 +480,7 @@ disables it for anyone who wants to experiment.
    self->stream_sink = nd_sink_start_stream (sink);
  
    if (!self->stream_sink)
-@@ -465,6 +806,8 @@ find_sink_list_row_activated_cb (NdWindow *self, NdSinkRow *row, GtkListBox *sin
+@@ -465,6 +830,8 @@ find_sink_list_row_activated_cb (NdWindow *self, NdSinkRow *row, GtkListBox *sin
  
    g_object_set (self->meta_provider, "discover", FALSE, NULL);
    g_list_store_append (self->connect_sink_list_model, self->stream_sink);
@@ -460,3 +489,14 @@ disables it for anyone who wants to experiment.
  }
  
  static void
+@@ -556,6 +923,10 @@ gnome_nd_window_dispose (GObject *obj)
+ {
+   NdWindow *self = ND_WINDOW (obj);
+ 
++  g_clear_handle_id (&self->reconnect_id, g_source_remove);
++  g_clear_handle_id (&self->reconnect_idle_id, g_source_remove);
++  g_clear_object (&self->reconnect_sink);
++
+ #ifdef HAVE_AVAHI
+   g_object_run_dispose (G_OBJECT (self->avahi_client));
+ #endif
