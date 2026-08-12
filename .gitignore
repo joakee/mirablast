@@ -1,5 +1,6 @@
 # makepkg build artifacts, if built in-tree under packaging/
 packaging/src/
 packaging/pkg/
+packaging/gnome-network-displays/
 packaging/*.pkg.tar*
 packaging/.SRCINFO
