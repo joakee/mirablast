@@ -61,12 +61,18 @@ Reconnects are rate limited: if the capture looks lost again within a
 minute of one, something other than a one-off resize is wrong and cycling
 the session would only make it worse.
 
+Finally, the reconnect timer retires itself once the sink is streaming
+again, and a completed connect clears the retry budget. Without those the
+timer armed for one reconnect spins for the rest of the session, and the
+non-zero source id makes every later reconnect request return early -- so
+the first reset after connecting recovered and every one after it left the
+picture shaking. The early returns now say why they skipped.
+
 XDamage is deliberately left at its default (enabled). Forcing it off
 here made the encoded stream flicker badly and smear the cursor on a real
 Miracast sink, while an identical uncropped capture was clean; the full
 frame reads interact badly with the rest of the pipeline. $GND_X11_DAMAGE=0
 disables it for anyone who wants to experiment.
---- a/src/app/nd-window.c
 --- a/src/app/nd-window.c
 +++ b/src/app/nd-window.c
 @@ -16,6 +16,8 @@
@@ -103,7 +109,7 @@ disables it for anyone who wants to experiment.
    GPtrArray             *sink_property_bindings;
  
    /* Template widgets */
-@@ -143,6 +156,360 @@ nd_window_screencast_get_source (NdWindow * self)
+@@ -143,6 +156,386 @@ nd_window_screencast_get_source (NdWindow * self)
    return g_steal_pointer (&src);
  }
  
@@ -158,11 +164,25 @@ disables it for anyone who wants to experiment.
 +
 +  if (self->stream_sink)
 +    {
++      g_object_get (self->stream_sink, "state", &state, NULL);
++
 +      /* A failed attempt parks the sink in ERROR; drop it so it can reach
 +       * DISCONNECTED and be started again. */
-+      g_object_get (self->stream_sink, "state", &state, NULL);
 +      if (state == ND_SINK_STATE_ERROR)
-+        nd_sink_stop_stream (self->stream_sink);
++        {
++          nd_sink_stop_stream (self->stream_sink);
++          return G_SOURCE_CONTINUE;
++        }
++
++      /* Streaming again, so there is nothing left to reconnect. Retiring here
++       * matters: this timer would otherwise spin for the rest of the session,
++       * and reconnect_id staying set makes every later reconnect request bail
++       * out silently. */
++      if (state == ND_SINK_STATE_STREAMING)
++        {
++          self->reconnect_id = 0;
++          return G_SOURCE_REMOVE;
++        }
 +
 +      return G_SOURCE_CONTINUE;
 +    }
@@ -225,10 +245,22 @@ disables it for anyone who wants to experiment.
 +    }
 +
 +  if (self->reconnect_id != 0)
-+    return;                     /* already on its way */
++    {
++      g_message ("GND_X11_REGION_FILE: re-connect already in progress, skipping");
++      return;
++    }
 +
-+  if (!self->reconnect_sink || !self->stream_sink)
-+    return;
++  if (!self->reconnect_sink)
++    {
++      g_message ("GND_X11_REGION_FILE: no sink remembered, not re-connecting");
++      return;
++    }
++
++  if (!self->stream_sink)
++    {
++      g_message ("GND_X11_REGION_FILE: no active stream, not re-connecting");
++      return;
++    }
 +
 +  /* Never reconnect in a tight loop: if the capture looks lost again right
 +   * after a reconnect, something other than a one-off resize is wrong and
@@ -464,7 +496,7 @@ disables it for anyone who wants to experiment.
  static GstElement *
  sink_create_source_cb (NdWindow * self, NdSink * sink)
  {
-@@ -153,7 +520,10 @@ sink_create_source_cb (NdWindow * self, NdSink * sink)
+@@ -153,7 +546,10 @@ sink_create_source_cb (NdWindow * self, NdSink * sink)
    bin = GST_BIN (gst_bin_new ("screencast source bin"));
    g_debug ("use x11: %d", self->use_x11);
    if (self->use_x11)
@@ -476,7 +508,7 @@ disables it for anyone who wants to experiment.
    else
      src = nd_window_screencast_get_source (self);
  
-@@ -172,7 +542,46 @@ sink_create_source_cb (NdWindow * self, NdSink * sink)
+@@ -172,7 +568,46 @@ sink_create_source_cb (NdWindow * self, NdSink * sink)
                  NULL);
    gst_bin_add (bin, dst);
  
@@ -524,7 +556,7 @@ disables it for anyone who wants to experiment.
      {
        /* Initial caps for virtual display */
        caps = gst_caps_new_simple ("video/x-raw",
-@@ -280,6 +689,18 @@ sink_notify_state_cb (NdWindow *self, GParamSpec *pspec, NdSink *sink)
+@@ -280,6 +715,18 @@ sink_notify_state_cb (NdWindow *self, GParamSpec *pspec, NdSink *sink)
        g_list_store_append (self->error_sink_list_model, self->stream_sink);
  
        gtk_stack_set_visible_child_name (self->step_stack, "error");
@@ -543,7 +575,7 @@ disables it for anyone who wants to experiment.
        break;
  
      case ND_SINK_STATE_DISCONNECTED:
-@@ -383,7 +804,6 @@ nd_screencast_init_cb (GObject      *source_object,
+@@ -383,7 +830,6 @@ nd_screencast_init_cb (GObject      *source_object,
  static void
  find_sink_list_row_activated_cb (NdWindow *self, NdSinkRow *row, GtkListBox *sink_list)
  {
@@ -551,7 +583,7 @@ disables it for anyone who wants to experiment.
  
    if (!self->use_x11 && !self->portal)
      {
-@@ -408,7 +828,12 @@ find_sink_list_row_activated_cb (NdWindow *self, NdSinkRow *row, GtkListBox *sin
+@@ -408,7 +854,12 @@ find_sink_list_row_activated_cb (NdWindow *self, NdSinkRow *row, GtkListBox *sin
  
    g_assert (ND_IS_SINK_ROW (row));
  
@@ -565,16 +597,20 @@ disables it for anyone who wants to experiment.
    self->stream_sink = nd_sink_start_stream (sink);
  
    if (!self->stream_sink)
-@@ -465,6 +890,8 @@ find_sink_list_row_activated_cb (NdWindow *self, NdSinkRow *row, GtkListBox *sin
+@@ -465,6 +916,12 @@ find_sink_list_row_activated_cb (NdWindow *self, NdSinkRow *row, GtkListBox *sin
  
    g_object_set (self->meta_provider, "discover", FALSE, NULL);
    g_list_store_append (self->connect_sink_list_model, self->stream_sink);
 +
 +  g_set_object (&self->reconnect_sink, sink);
++
++  /* Stop any leftover retry budget from arming a timer on a later, unrelated
++   * error. */
++  self->reconnect_tries = 0;
  }
  
  static void
-@@ -556,6 +983,10 @@ gnome_nd_window_dispose (GObject *obj)
+@@ -556,6 +1013,10 @@ gnome_nd_window_dispose (GObject *obj)
  {
    NdWindow *self = ND_WINDOW (obj);
  
