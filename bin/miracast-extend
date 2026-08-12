@@ -11,8 +11,11 @@
 # for it); REFRESH=<Hz> sets the refresh rate, default 60.
 #
 # The virtual display is a real RandR output, so it appears in arandr and
-# xfce4-display-settings and xfwm4 treats it as usable desktop. Streaming only
-# that region needs gnome-network-displays built with gnd-x11-region-crop.patch.
+# xfce4-display-settings and xfwm4 treats it as usable desktop, and can be
+# repositioned there while streaming: `run` watches its geometry and writes it
+# to $REGION_FILE, which the patched gnd re-reads and applies to the running
+# capture. Streaming only that region needs gnome-network-displays built with
+# gnd-x11-region-crop.patch.
 
 set -euo pipefail
 
@@ -32,6 +35,7 @@ detect_primary () {
 PRIMARY=${PRIMARY:-$(detect_primary)}
 HELPER=${HELPER:-"$SCRIPT_DIR/evdi-virtual-display"}
 LOG=${LOG:-${XDG_RUNTIME_DIR:-/tmp}/evdi-virtual-display.log}
+REGION_FILE=${REGION_FILE:-${XDG_RUNTIME_DIR:-/tmp}/miracast-extend.region}
 REFRESH=${REFRESH:-}
 
 [[ -n $PRIMARY ]] || die "no connected output found to use as \$PRIMARY; set it explicitly"
@@ -139,6 +143,7 @@ setup () {
   [[ -n ${VW:-} ]] || { stop_helper; die "output $out did not report geometry"; }
 
   OUT=$out
+  write_region
   echo "virtual display '$out' ${VW}x${VH} at +${VX}+${VY}"
   echo "GND_X11_REGION=$(region_string)"
 }
@@ -151,6 +156,43 @@ pos_after_primary () {
 
 region_string () { echo "${VW}x${VH}+${VX}+${VY}"; }
 
+# Publish the region for the patched gnd to pick up. Written via a temporary
+# file in the same directory so gnd never reads a half-written line.
+write_region () {
+  local tmp
+  tmp=$(mktemp "${REGION_FILE}.XXXXXX") || return 0
+  printf '%s\n' "$(region_string)" >"$tmp"
+  mv -f "$tmp" "$REGION_FILE"
+}
+
+# Follow the virtual output while gnd streams. gnd re-reads $REGION_FILE once a
+# second and moves the crop to match, so repositioning the display in arandr or
+# xfce4-display-settings does not interrupt the cast.
+#
+# Only the origin can change this way: the capture size was fixed when caps
+# were negotiated. The EDID advertises a single mode, so the size only changes
+# if the output is rotated, which gnd reports and ignores.
+watch_region () {
+  local last
+  last=$(region_string)
+  while kill -0 "$1" 2>/dev/null; do
+    sleep 1
+    VW= VH= VX= VY=
+    read -r VW VH VX VY < <(geom_of "$OUT") || true
+    # No geometry: the output is momentarily off or being reconfigured. Keep
+    # the last known region rather than writing a bogus one.
+    if [[ -z ${VW:-} ]]; then
+      read -r VW VH VX VY <<<"${last//[x+]/ }"
+      continue
+    fi
+    if [[ $(region_string) != "$last" ]]; then
+      last=$(region_string)
+      echo "virtual display moved to +${VX}+${VY}; capture region -> $last"
+      write_region
+    fi
+  done
+}
+
 teardown () {
   local out
   out=$(evdi_output)
@@ -162,6 +204,7 @@ teardown () {
     xrandr --output "$PRIMARY" --auto --primary --pos 0x0 2>/dev/null || true
   fi
   stop_helper
+  rm -f "$REGION_FILE"
   echo "virtual display removed"
 }
 
@@ -197,7 +240,12 @@ case "${1:-}" in
     claim_instance
     setup "${2:-}"
     trap teardown EXIT INT TERM
-    GND_X11_REGION="$(region_string)" gnome-network-displays
+    GND_X11_REGION="$(region_string)" GND_X11_REGION_FILE="$REGION_FILE" \
+      gnome-network-displays &
+    gnd_pid=$!
+    echo "tracking '$OUT' for repositioning (region file: $REGION_FILE)"
+    watch_region "$gnd_pid"
+    wait "$gnd_pid" 2>/dev/null || true
     ;;
   off)
     teardown
@@ -213,6 +261,11 @@ case "${1:-}" in
       helper_pids | sed 's/^/helper pid: /'
     else
       echo "no evdi output found"
+    fi
+    if [[ -f $REGION_FILE ]]; then
+      echo "capture region: $(cat "$REGION_FILE") ($REGION_FILE)"
+    else
+      echo "no capture region published"
     fi
     ;;
   *)
