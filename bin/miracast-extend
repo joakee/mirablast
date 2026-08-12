@@ -49,7 +49,7 @@ evdi_output () {
     drv=$(basename "$(readlink -f "$card/device/driver")")
     [[ $drv == evdi ]] || continue
     conn=$(basename "$path"); conn=${conn#*-}
-    xrandr --query | awk '/ (dis)?connected/ {print $1}' |
+    xrandr --query --current | awk '/ (dis)?connected/ {print $1}' |
       grep -xE "${conn}(-[0-9]+)?" | head -1
     return 0
   done
@@ -111,14 +111,27 @@ setup () {
   # still alive instead of waiting the full timeout for a mode it already
   # rejected.
   echo "waiting for the evdi output (evdi_open takes ~12s)..."
-  local out=""
+  local out="" ticks=0
   for _ in {1..180}; do
     sleep 0.25
+    ticks=$((ticks + 1))
     if [[ -z $(helper_pids) ]]; then
       die "evdi-virtual-display exited early; see $LOG"
     fi
+
+    # Poll the server's cached view. A plain query re-probes every output over
+    # DDC and blocks X for ~0.8s, which is ruinous four times a second: it
+    # used to stretch this wait to ~39s and freeze the desktop throughout.
+    # evdi's hotplug reaches X by itself (measured: the output turns up in
+    # --current about 8s in), so a probe is only insurance for a server that
+    # never gets the event. Hold it back until well past the normal case so it
+    # costs nothing here.
+    if (( ticks > 60 && ticks % 20 == 0 )); then
+      xrandr --query >/dev/null 2>&1 || true
+    fi
+
     out=$(evdi_output)
-    [[ -n $out ]] && xrandr --query | grep -qE "^${out} connected" && break
+    [[ -n $out ]] && xrandr --query --current | grep -qE "^${out} connected" && break
     out=""
   done
   [[ -n $out ]] || { stop_helper; die "evdi output never came up; see $LOG"; }
