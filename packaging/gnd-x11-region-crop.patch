@@ -62,7 +62,10 @@ minute of one, something other than a one-off resize is wrong and cycling
 the session would only make it worse.
 
 Finally, the reconnect timer retires itself once the sink is streaming
-again, and a completed connect clears the retry budget. Without those the
+again, and the retry budget is cleared when the sink reports STREAMING --
+not when a connect is issued, because a reconnect's own connect runs
+through the same path and only fails afterwards, which would leave the
+attempt with no retries and park the session on the error page. Without those the
 timer armed for one reconnect spins for the rest of the session, and the
 non-zero source id makes every later reconnect request return early -- so
 the first reset after connecting recovered and every one after it left the
@@ -556,7 +559,20 @@ disables it for anyone who wants to experiment.
      {
        /* Initial caps for virtual display */
        caps = gst_caps_new_simple ("video/x-raw",
-@@ -280,6 +715,18 @@ sink_notify_state_cb (NdWindow *self, GParamSpec *pspec, NdSink *sink)
+@@ -270,6 +705,12 @@ sink_notify_state_cb (NdWindow *self, GParamSpec *pspec, NdSink *sink)
+       g_list_store_append (self->stream_sink_list_model, self->stream_sink);
+ 
+       gtk_stack_set_visible_child_name (self->step_stack, "stream");
++
++      /* Streaming again: the retry budget has done its job. Clearing it here
++       * rather than at connect time matters, because a reconnect's own
++       * connect only fails after the fact -- zeroing it earlier left nothing
++       * to retry with and parked the session on the error page. */
++      self->reconnect_tries = 0;
+       break;
+ 
+     case ND_SINK_STATE_ERROR:
+@@ -280,6 +721,18 @@ sink_notify_state_cb (NdWindow *self, GParamSpec *pspec, NdSink *sink)
        g_list_store_append (self->error_sink_list_model, self->stream_sink);
  
        gtk_stack_set_visible_child_name (self->step_stack, "error");
@@ -575,7 +591,7 @@ disables it for anyone who wants to experiment.
        break;
  
      case ND_SINK_STATE_DISCONNECTED:
-@@ -383,7 +830,6 @@ nd_screencast_init_cb (GObject      *source_object,
+@@ -383,7 +836,6 @@ nd_screencast_init_cb (GObject      *source_object,
  static void
  find_sink_list_row_activated_cb (NdWindow *self, NdSinkRow *row, GtkListBox *sink_list)
  {
@@ -583,7 +599,7 @@ disables it for anyone who wants to experiment.
  
    if (!self->use_x11 && !self->portal)
      {
-@@ -408,7 +854,12 @@ find_sink_list_row_activated_cb (NdWindow *self, NdSinkRow *row, GtkListBox *sin
+@@ -408,7 +860,12 @@ find_sink_list_row_activated_cb (NdWindow *self, NdSinkRow *row, GtkListBox *sin
  
    g_assert (ND_IS_SINK_ROW (row));
  
@@ -597,20 +613,16 @@ disables it for anyone who wants to experiment.
    self->stream_sink = nd_sink_start_stream (sink);
  
    if (!self->stream_sink)
-@@ -465,6 +916,12 @@ find_sink_list_row_activated_cb (NdWindow *self, NdSinkRow *row, GtkListBox *sin
+@@ -465,6 +922,8 @@ find_sink_list_row_activated_cb (NdWindow *self, NdSinkRow *row, GtkListBox *sin
  
    g_object_set (self->meta_provider, "discover", FALSE, NULL);
    g_list_store_append (self->connect_sink_list_model, self->stream_sink);
 +
 +  g_set_object (&self->reconnect_sink, sink);
-+
-+  /* Stop any leftover retry budget from arming a timer on a later, unrelated
-+   * error. */
-+  self->reconnect_tries = 0;
  }
  
  static void
-@@ -556,6 +1013,10 @@ gnome_nd_window_dispose (GObject *obj)
+@@ -556,6 +1015,10 @@ gnome_nd_window_dispose (GObject *obj)
  {
    NdWindow *self = ND_WINDOW (obj);
  
