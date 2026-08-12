@@ -27,8 +27,8 @@ die () { echo "miracast-extend: $*" >&2; exit 1; }
 # connected output. Override with $PRIMARY if autodetection picks wrong.
 detect_primary () {
   local p
-  p=$(xrandr --query | awk '/ connected primary/ {print $1; exit}')
-  [[ -n $p ]] || p=$(xrandr --query | awk '/ connected/ {print $1; exit}')
+  p=$(xrandr --query --current | awk '/ connected primary/ {print $1; exit}')
+  [[ -n $p ]] || p=$(xrandr --query --current | awk '/ connected/ {print $1; exit}')
   echo "$p"
 }
 
@@ -57,8 +57,17 @@ evdi_output () {
 }
 
 # Geometry of an output: width height x y
+#
+# --current is not an optimisation detail: a plain `xrandr --query` re-probes
+# every output over DDC and blocks the X server for 0.4-1.3s while it does.
+# Polling that once a second froze every display on the machine once a second
+# (the pointer kept moving, being on the hardware cursor plane). --current
+# reads the configuration the server already has, in about 5ms, and CRTC
+# positions live in that configuration -- so a display moved in arandr is
+# still seen. Only hardware appearing or disappearing needs the probe, which
+# is why the wait for the evdi output below still uses a plain query.
 geom_of () {
-  xrandr --query | awk -v o="$1" '
+  xrandr --query --current | awk -v o="$1" '
     $1 == o && $2 == "connected" {
       for (i = 3; i <= NF; i++)
         if ($i ~ /^[0-9]+x[0-9]+\+[0-9]+\+[0-9]+$/) {
