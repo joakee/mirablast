@@ -1,0 +1,50 @@
+From: local
+Subject: [PATCH] wfd: make the long-GOP keyframe interval configurable
+
+When the sink advertises IDR-request capability, the keyframe interval is
+stretched to 10 seconds' worth of frames on the assumption that the sink will
+ask for an IDR when it needs one. Sinks that do not actually issue those
+requests leave any packet loss on screen until the next scheduled keyframe --
+up to ten seconds of smeared cursor trails and flickering blocks.
+
+That assumption fails badly on a single-radio adapter running a P2P group
+concurrently with a normal STA association: the radio time-slices between two
+channels and loss is continuous (~3% tx retries here), so the picture is never
+clean for long.
+
+Honour $GND_GOP_SECONDS (default 1) for that interval so corruption self-heals
+quickly. Set it to 10 to restore the previous behaviour.
+
+--- a/src/wfd/wfd-media-factory.c
++++ b/src/wfd/wfd-media-factory.c
+@@ -550,8 +550,29 @@
+   /* Decrease the number of keyframes if the device is able to request
+    * IDRs by itself.
+    * Note that VAAPI H264 appears to run into an assertion error in version 1.14.4 */
+   if (params->idr_request_capability && !(quirks & WFD_QUIRK_NO_IDR))
+-    gop_size = 10 * resolution->refresh_rate;
++    {
++      /* Sinks that advertise the capability but never request an IDR leave
++       * packet loss on screen until the next scheduled keyframe. */
++      const gchar *gop_env = g_getenv ("GND_GOP_SECONDS");
++      guint gop_seconds = 1;
++
++      if (gop_env && *gop_env)
++        {
++          gchar *end = NULL;
++          guint64 parsed = g_ascii_strtoull (gop_env, &end, 10);
++
++          if (end && *end == '\0' && parsed >= 1 && parsed <= 60)
++            gop_seconds = (guint) parsed;
++          else
++            g_warning ("GND_GOP_SECONDS must be an integer from 1 to 60 "
++                       "(got \"%s\"), using %u", gop_env, gop_seconds);
++        }
++
++      gop_size = gop_seconds * resolution->refresh_rate;
++      g_debug ("WfdMediaFactory: keyframe interval %u frames (%us)",
++               gop_size, gop_seconds);
++    }
+
+   srcfilter = gst_bin_get_by_name (bin, "srcfilter");
+   if (srcfilter != NULL)

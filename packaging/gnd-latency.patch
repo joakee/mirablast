@@ -1,0 +1,56 @@
+From: local
+Subject: [PATCH] wfd: don't charge every encoder openh264's latency workaround
+
+The pipeline latency is pinned to 500ms unconditionally, but the comment
+explaining it is specific to openh264 with usage-type "screen", whose latency
+spikes after scene changes. Sessions using a hardware encoder (vah264enc) pay
+half a second of lag for a workaround that does not apply to them, which is a
+lot on an interactive screencast.
+
+Use 500ms only for openh264 and 100ms otherwise, overridable with
+$GND_LATENCY_MS (0-2000) for tuning against a particular sink.
+
+--- a/src/wfd/wfd-media-factory.c
++++ b/src/wfd/wfd-media-factory.c
+@@ -497,14 +497,37 @@
+ static GstElement *
+ wfd_media_factory_create_pipeline (GstRTSPMediaFactory *factory, GstRTSPMedia *media)
+ {
++  WfdMediaFactory *self = WFD_MEDIA_FACTORY (factory);
+   GstElement *pipeline;
++  const gchar *latency_env;
++  guint latency_ms;
+
+   pipeline = GST_RTSP_MEDIA_FACTORY_CLASS (wfd_media_factory_parent_class)->create_pipeline (factory, media);
+
+-  /* We need a high latency for the openh264 encoder at least when the
+-   * usage-type is set to "screen". After e.g. scene changes the latency will
+-   * be very high for short periods of time, and this prevents further issues. */
+-  gst_pipeline_set_latency (GST_PIPELINE (pipeline), 500 * GST_MSECOND);
++  /* openh264 with usage-type "screen" needs the slack: its latency spikes for
++   * short periods after scene changes. Other encoders do not, and charging
++   * them half a second of lag for a workaround that does not apply is
++   * needlessly laggy on an interactive screencast. */
++  if (wfd_media_factory_profiles[self->factory_profile].video_encoder == ELEMENT_OPENH264)
++    latency_ms = 500;
++  else
++    latency_ms = 100;
++
++  latency_env = g_getenv ("GND_LATENCY_MS");
++  if (latency_env && *latency_env)
++    {
++      gchar *end = NULL;
++      guint64 parsed = g_ascii_strtoull (latency_env, &end, 10);
++
++      if (end && *end == '\0' && parsed <= 2000)
++        latency_ms = (guint) parsed;
++      else
++        g_warning ("GND_LATENCY_MS must be an integer from 0 to 2000 "
++                   "(got \"%s\"), using %u", latency_env, latency_ms);
++    }
++
++  g_debug ("WfdMediaFactory: pipeline latency %ums", latency_ms);
++  gst_pipeline_set_latency (GST_PIPELINE (pipeline), latency_ms * GST_MSECOND);
+
+   return pipeline;
+ }

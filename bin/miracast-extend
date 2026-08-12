@@ -1,0 +1,222 @@
+#!/usr/bin/env bash
+# Bring up an evdi-backed virtual monitor to the right of the primary panel and
+# stream just that monitor over Miracast via gnome-network-displays.
+#
+#   miracast-extend on  [WxH]   create the virtual display (default 1280x720)
+#   miracast-extend run [WxH]   create it, launch gnd, tear down on exit
+#   miracast-extend off         remove it
+#   miracast-extend status      show outputs and the region string
+#
+# WxH accepts any resolution (evdi-virtual-display computes a CVT-RB timing
+# for it); REFRESH=<Hz> sets the refresh rate, default 60.
+#
+# The virtual display is a real RandR output, so it appears in arandr and
+# xfce4-display-settings and xfwm4 treats it as usable desktop. Streaming only
+# that region needs gnome-network-displays built with gnd-x11-region-crop.patch.
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+die () { echo "miracast-extend: $*" >&2; exit 1; }
+
+# Whatever xrandr currently calls primary, falling back to the first
+# connected output. Override with $PRIMARY if autodetection picks wrong.
+detect_primary () {
+  local p
+  p=$(xrandr --query | awk '/ connected primary/ {print $1; exit}')
+  [[ -n $p ]] || p=$(xrandr --query | awk '/ connected/ {print $1; exit}')
+  echo "$p"
+}
+
+PRIMARY=${PRIMARY:-$(detect_primary)}
+HELPER=${HELPER:-"$SCRIPT_DIR/evdi-virtual-display"}
+LOG=${LOG:-${XDG_RUNTIME_DIR:-/tmp}/evdi-virtual-display.log}
+REFRESH=${REFRESH:-}
+
+[[ -n $PRIMARY ]] || die "no connected output found to use as \$PRIMARY; set it explicitly"
+
+# Name of the X output backed by the evdi card, e.g. DVI-I-1-1
+evdi_output () {
+  local path card drv conn
+  for path in /sys/class/drm/card*-*; do
+    card=${path%%-*}
+    [[ -e $card/device/driver ]] || continue
+    drv=$(basename "$(readlink -f "$card/device/driver")")
+    [[ $drv == evdi ]] || continue
+    conn=$(basename "$path"); conn=${conn#*-}
+    xrandr --query | awk '/ (dis)?connected/ {print $1}' |
+      grep -xE "${conn}(-[0-9]+)?" | head -1
+    return 0
+  done
+  return 0
+}
+
+# Geometry of an output: width height x y
+geom_of () {
+  xrandr --query | awk -v o="$1" '
+    $1 == o && $2 == "connected" {
+      for (i = 3; i <= NF; i++)
+        if ($i ~ /^[0-9]+x[0-9]+\+[0-9]+\+[0-9]+$/) {
+          split($i, a, /[x+]/); print a[1], a[2], a[3], a[4]; exit
+        }
+    }'
+}
+
+helper_pids () { pgrep -x -f "python3 $HELPER .*" || true; }
+
+stop_helper () {
+  local pids
+  pids=$(helper_pids)
+  if [[ -z $pids ]]; then
+    return 0
+  fi
+  kill $pids 2>/dev/null || true
+  # An older helper parked in drm_read() will not act on SIGTERM; escalate
+  # rather than leave it holding the evdi device, which blocks the next start.
+  for _ in {1..12}; do
+    sleep 0.25
+    [[ -z $(helper_pids) ]] && return 0
+  done
+  kill -9 $(helper_pids) 2>/dev/null || true
+  sleep 0.5
+  return 0
+}
+
+setup () {
+  local mode=${1:-1280x720}
+  [[ $mode =~ ^[0-9]+x[0-9]+$ ]] || die "resolution must be WxH, got '$mode'"
+  [[ -x $HELPER ]] || die "helper not found or not executable at $HELPER; set \$HELPER"
+
+  stop_helper
+  setsid "$HELPER" "$mode" ${REFRESH:+--refresh "$REFRESH"} >"$LOG" 2>&1 </dev/null &
+  disown || true
+
+  # evdi_open() alone takes ~12s, so this wait has to be generous. Any WxH is
+  # accepted now (the helper computes a CVT-RB timing), so a bad resolution
+  # fails inside the helper rather than at this script's gate; watch that it's
+  # still alive instead of waiting the full timeout for a mode it already
+  # rejected.
+  echo "waiting for the evdi output (evdi_open takes ~12s)..."
+  local out=""
+  for _ in {1..180}; do
+    sleep 0.25
+    if [[ -z $(helper_pids) ]]; then
+      die "evdi-virtual-display exited early; see $LOG"
+    fi
+    out=$(evdi_output)
+    [[ -n $out ]] && xrandr --query | grep -qE "^${out} connected" && break
+    out=""
+  done
+  [[ -n $out ]] || { stop_helper; die "evdi output never came up; see $LOG"; }
+
+  # xfsettingsd usually auto-places a newly connected output; be explicit.
+  xrandr --output "$out" --mode "$mode" --right-of "$PRIMARY" 2>/dev/null ||
+    xrandr --output "$out" --mode "$mode" --pos "$(pos_after_primary)" || true
+  sleep 0.5
+
+  # xfsettingsd applies its active display profile when outputs change, and has
+  # been seen switching the panel off and leaving the virtual display as the
+  # only monitor. It reacts a second or two after we position the output, so
+  # watch for a while rather than checking once. Never leave the user staring
+  # at a blank laptop.
+  local fixed=0
+  for _ in {1..32}; do
+    sleep 0.25
+    if [[ -z $(geom_of "$PRIMARY") ]]; then
+      fixed=1
+      echo "$PRIMARY was switched off by a display profile; re-enabling it" >&2
+      xrandr --output "$PRIMARY" --auto --primary --pos 0x0 \
+             --output "$out" --mode "$mode" --pos "$(pos_after_primary)" || true
+    fi
+  done
+  if [[ $fixed = 1 ]]; then
+    echo "note: check 'xfconf-query -c displays -lv' if this keeps happening" >&2
+  fi
+
+  VW= VH= VX= VY=
+  read -r VW VH VX VY < <(geom_of "$out") || true
+  [[ -n ${VW:-} ]] || { stop_helper; die "output $out did not report geometry"; }
+
+  OUT=$out
+  echo "virtual display '$out' ${VW}x${VH} at +${VX}+${VY}"
+  echo "GND_X11_REGION=$(region_string)"
+}
+
+pos_after_primary () {
+  local PW PH PX PY
+  read -r PW PH PX PY < <(geom_of "$PRIMARY") || true
+  echo "$(( ${PX:-0} + ${PW:-1920} ))x0"
+}
+
+region_string () { echo "${VW}x${VH}+${VX}+${VY}"; }
+
+teardown () {
+  local out
+  out=$(evdi_output)
+  # Enable the panel in the same call that drops the virtual output, so the
+  # session is never left with no active monitor.
+  if [[ -n $out ]]; then
+    xrandr --output "$PRIMARY" --auto --primary --pos 0x0 --output "$out" --off 2>/dev/null || true
+  else
+    xrandr --output "$PRIMARY" --auto --primary --pos 0x0 2>/dev/null || true
+  fi
+  stop_helper
+  echo "virtual display removed"
+}
+
+# gnd is a single-instance GtkApplication: launching it while another copy is
+# running just raises that window and exits immediately, which would trip the
+# teardown trap.
+claim_instance () {
+  local pids
+  pids=$(pgrep -f -x '(/usr/bin/)?gnome-network-displays' || true)
+  if [[ -z $pids ]]; then
+    return 0
+  fi
+  if [[ ${KEEP_RUNNING:-0} = 1 ]]; then
+    die "gnome-network-displays is already running (pid $pids); quit it first"
+  fi
+  echo "stopping existing gnome-network-displays (pid $pids) - it would swallow this launch"
+  kill $pids 2>/dev/null || true
+  for _ in {1..20}; do
+    pgrep -f -x '(/usr/bin/)?gnome-network-displays' >/dev/null || break
+    sleep 0.25
+  done
+  if pgrep -f -x '(/usr/bin/)?gnome-network-displays' >/dev/null; then
+    die "it did not exit; kill -9 $pids and retry"
+  fi
+  return 0
+}
+
+case "${1:-}" in
+  on)
+    setup "${2:-}"
+    ;;
+  run)
+    claim_instance
+    setup "${2:-}"
+    trap teardown EXIT INT TERM
+    GND_X11_REGION="$(region_string)" gnome-network-displays
+    ;;
+  off)
+    teardown
+    ;;
+  status)
+    xrandr --query | grep -E " connected"
+    echo "---"
+    xrandr --listmonitors
+    echo "---"
+    out=$(evdi_output)
+    if [[ -n $out ]]; then
+      echo "evdi output: $out"
+      helper_pids | sed 's/^/helper pid: /'
+    else
+      echo "no evdi output found"
+    fi
+    ;;
+  *)
+    sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'
+    exit 1
+    ;;
+esac

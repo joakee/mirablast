@@ -1,0 +1,287 @@
+#!/usr/bin/env python3
+"""Attach an EDID to the evdi device so X exposes it as a real output.
+
+evdi's connector stays "disconnected" until some userspace process opens the
+device and hands it an EDID -- that is normally DisplayLink's daemon. This does
+just that part, with a synthesised EDID for the requested resolution, and then
+holds the connection open until it is killed.
+
+The result is an ordinary RandR output (arandr, xfce4-display-settings and
+xfwm4 all treat it as a real monitor), unlike `xrandr --setmonitor`, which only
+creates a RandR 1.5 monitor that window managers ignore when computing usable
+desktop area.
+
+    evdi-virtual-display 1280x720              # hold until SIGTERM
+    evdi-virtual-display 2560x1440 --refresh 30
+    evdi-virtual-display --list-modes          # a few common presets, not a limit
+"""
+
+import argparse
+import fcntl
+import math
+import os
+import re
+import signal
+import sys
+import threading
+
+# VESA CVT-RB v1 (reduced blanking) constants: the whole point of "reduced"
+# blanking is that the horizontal porches/sync are fixed pixel counts
+# regardless of resolution, which is what makes a timing computable for any
+# WxH instead of only resolutions someone hand-tabulated. Same formula as
+# `cvt -r` and the kernel's drm_cvt_mode(reduced=true); +HSync -VSync is part
+# of the RB spec, not a free choice.
+_RB_H_FRONT = 48
+_RB_H_SYNC = 32
+_RB_H_BACK = 80
+_RB_H_BLANK = _RB_H_FRONT + _RB_H_SYNC + _RB_H_BACK  # 160
+_RB_V_FRONT = 3
+_RB_MIN_V_BACK = 6
+_RB_MIN_VBLANK_US = 460.0
+
+# A few common presets for --list-modes. Purely a convenience list now, not a
+# whitelist -- any WxH is accepted.
+_PRESETS = (
+    "640x480", "800x600", "1024x768", "1280x720", "1280x800",
+    "1366x768", "1920x1080", "2560x1440", "3840x2160",
+)
+
+
+def cvt_rb_timing(hact, vact, refresh):
+    """VESA CVT-RB v1 detailed timing for an arbitrary resolution/refresh.
+
+    Returns (pixel clock kHz, hact, hfp, hsync, hbp, vact, vfp, vsync, vbp,
+    +hsync, +vsync). CVT's 8px horizontal granularity is skipped: it exists
+    for real hardware character clocks, and evdi has no such constraint, so
+    the requested width comes out exact instead of rounded.
+    """
+    # Vsync width from aspect ratio (same table full, non-reduced CVT uses).
+    if vact % 3 == 0 and vact * 4 // 3 == hact:
+        vsync = 4
+    elif vact % 9 == 0 and vact * 16 // 9 == hact:
+        vsync = 5
+    elif vact % 10 == 0 and vact * 16 // 10 == hact:
+        vsync = 6
+    elif vact % 4 == 0 and vact * 5 // 4 == hact:
+        vsync = 7
+    elif vact % 9 == 0 and vact * 15 // 9 == hact:
+        vsync = 7
+    else:
+        vsync = 10
+
+    # Estimate the line period from the target frame time minus the minimum
+    # vertical blank, then size vblank in lines to clear that 460us floor.
+    frame_us = 1_000_000.0 / refresh
+    hperiod_est = (frame_us - _RB_MIN_VBLANK_US) / vact
+    vbi_lines = math.ceil(_RB_MIN_VBLANK_US / hperiod_est)
+    vbi_lines = max(vbi_lines, _RB_MIN_V_BACK + vsync + _RB_V_FRONT)
+    vback = vbi_lines - vsync - _RB_V_FRONT
+
+    htotal = hact + _RB_H_BLANK
+    vtotal = vact + vbi_lines
+    pclk_khz = round(htotal * vtotal * refresh / 1000)
+
+    return (pclk_khz, hact, _RB_H_FRONT, _RB_H_SYNC, _RB_H_BACK,
+            vact, _RB_V_FRONT, vsync, vback, True, False)
+
+
+def mfg_id(code):
+    v = 0
+    for ch in code:
+        v = (v << 5) | (ord(ch) - 64)
+    return bytes([(v >> 8) & 0xFF, v & 0xFF])
+
+
+def detailed_timing(t, wmm, hmm):
+    pclk, hact, hfp, hsync, hbp, vact, vfp, vsync, vbp, hpol, vpol = t
+    hblank = hfp + hsync + hbp
+    vblank = vfp + vsync + vbp
+    clk = pclk // 10  # EDID stores pixel clock in 10 kHz units
+
+    b = bytearray(18)
+    b[0] = clk & 0xFF
+    b[1] = (clk >> 8) & 0xFF
+    b[2] = hact & 0xFF
+    b[3] = hblank & 0xFF
+    b[4] = ((hact >> 8) << 4) | ((hblank >> 8) & 0x0F)
+    b[5] = vact & 0xFF
+    b[6] = vblank & 0xFF
+    b[7] = ((vact >> 8) << 4) | ((vblank >> 8) & 0x0F)
+    b[8] = hfp & 0xFF
+    b[9] = hsync & 0xFF
+    b[10] = ((vfp & 0x0F) << 4) | (vsync & 0x0F)
+    b[11] = (((hfp >> 8) & 3) << 6) | (((hsync >> 8) & 3) << 4) \
+        | (((vfp >> 4) & 3) << 2) | ((vsync >> 4) & 3)
+    b[12] = wmm & 0xFF
+    b[13] = hmm & 0xFF
+    b[14] = ((wmm >> 8) << 4) | ((hmm >> 8) & 0x0F)
+    b[15] = 0  # h border
+    b[16] = 0  # v border
+    b[17] = 0x18 | (0x04 if vpol else 0) | (0x02 if hpol else 0)
+    return bytes(b)
+
+
+def text_descriptor(tag, text):
+    b = bytearray(18)
+    b[3] = tag
+    payload = text[:13]
+    if len(payload) < 13:
+        payload += "\n" + " " * (12 - len(payload))
+    b[5:18] = payload.encode("ascii")
+    return bytes(b)
+
+
+def range_descriptor(t):
+    pclk = t[0]
+    b = bytearray(18)
+    b[3] = 0xFD
+    b[5] = 50                       # min vertical Hz
+    b[6] = 75                       # max vertical Hz
+    b[7] = 15                       # min horizontal kHz
+    b[8] = 100                      # max horizontal kHz
+    b[9] = (pclk + 9999) // 10000   # max pixel clock, 10 MHz units
+    b[10] = 0x00                    # no secondary timing formula
+    b[11] = 0x0A
+    for i in range(12, 18):
+        b[i] = 0x20
+    return bytes(b)
+
+
+def build_edid(hact, vact, refresh, name="Miracast"):
+    t = cvt_rb_timing(hact, vact, refresh)
+    wmm = round(hact * 25.4 / 96)
+    hmm = round(vact * 25.4 / 96)
+
+    e = bytearray(128)
+    e[0:8] = b"\x00\xff\xff\xff\xff\xff\xff\x00"
+    e[8:10] = mfg_id("LNX")
+    e[10:12] = (0x0001).to_bytes(2, "little")   # product code
+    e[12:16] = (1).to_bytes(4, "little")        # serial
+    e[16] = 1                                   # manufacture week
+    e[17] = 2026 - 1990                         # manufacture year
+    e[18] = 1                                   # EDID 1.4
+    e[19] = 4
+    e[20] = 0x80 | (0b010 << 4) | 0x05          # digital, 8 bpc, DisplayPort
+    e[21] = max(1, round(wmm / 10))             # cm
+    e[22] = max(1, round(hmm / 10))
+    e[23] = 120                                 # gamma 2.2
+    e[24] = 0x02                                # first DTD is preferred timing
+    e[25:35] = bytes([0xEE, 0x91, 0xA3, 0x54, 0x4C, 0x99, 0x26, 0x0F, 0x50, 0x54])
+    # established + standard timings left unused; the DTD carries the mode
+    for i in range(38, 54, 2):
+        e[i] = 0x01
+        e[i + 1] = 0x01
+    e[54:72] = detailed_timing(t, wmm, hmm)
+    e[72:90] = range_descriptor(t)
+    e[90:108] = text_descriptor(0xFC, name)     # monitor name
+    e[108:126] = text_descriptor(0x10, "")      # dummy
+    e[126] = 0                                  # no extension blocks
+    e[127] = (-sum(e[0:127])) & 0xFF
+    return bytes(e)
+
+
+def find_evdi_card():
+    import PyEvdi
+    for n in range(8):
+        try:
+            if PyEvdi.check_device(n) == PyEvdi.AVAILABLE:
+                return n
+        except Exception:
+            continue
+    return None
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("mode", nargs="?", default="1280x720", help="WxH, e.g. 1920x1080")
+    ap.add_argument("--refresh", type=int, default=60, help="Hz (default 60)")
+    ap.add_argument("--name", default="Miracast", help="monitor name in the EDID")
+    ap.add_argument("--card", type=int, default=None, help="evdi device index")
+    ap.add_argument("--area-limit", type=int, default=3840 * 2160,
+                    help="max mode area in pixels; evdi rejects every mode "
+                         "whose area exceeds it, and 0 rejects all of them")
+    ap.add_argument("--list-modes", action="store_true",
+                     help="print a few common presets and exit (not a whitelist)")
+    args = ap.parse_args()
+
+    if args.list_modes:
+        for m in _PRESETS:
+            print(m)
+        return 0
+
+    m = re.match(r"^(\d+)x(\d+)$", args.mode)
+    if not m:
+        print(f"mode must be WxH, got {args.mode!r}", file=sys.stderr)
+        return 2
+    hact, vact = int(m.group(1)), int(m.group(2))
+
+    if not (64 <= hact <= 4094 and 64 <= vact <= 4094):
+        print(f"resolution out of range: {hact}x{vact} (64-4094 each side)",
+              file=sys.stderr)
+        return 2
+    if not (1 <= args.refresh <= 240):
+        print(f"refresh out of range: {args.refresh} (1-240 Hz)", file=sys.stderr)
+        return 2
+
+    import PyEvdi
+
+    # A second client triggers evdi's "Double connect - replacing", which
+    # silently steals the device from the first one.
+    runtime = os.environ.get("XDG_RUNTIME_DIR", "/tmp")
+    lock = open(os.path.join(runtime, "evdi-virtual-display.lock"), "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        print("another evdi-virtual-display already holds the device",
+              file=sys.stderr)
+        return 1
+
+    card_n = args.card if args.card is not None else find_evdi_card()
+    if card_n is None:
+        print("no available evdi device (is the evdi module loaded?)",
+              file=sys.stderr)
+        return 1
+
+    edid = build_edid(hact, vact, args.refresh, args.name)
+    # evdi_open() consistently takes ~12s on this hardware (it registers an i2c
+    # adapter for the connector); connect() afterwards is instantaneous.
+    print(f"opening evdi card {card_n} (evdi_open takes ~12s)...", flush=True)
+    card = PyEvdi.Card(card_n)
+    # The binding advertises `str`, but pybind11's std::string caster takes
+    # bytes verbatim. Passing a str would UTF-8 re-encode every byte above
+    # 0x7F (starting with the 0xFF header), corrupting the EDID silently.
+    card.connect(edid, len(edid), args.area_limit, args.refresh)
+    print(f"evdi card {card_n} connected as '{args.name}' {hact}x{vact}@{args.refresh} "
+          f"(area limit {args.area_limit} px)", flush=True)
+
+    # handle_events() blocks in drm_read() and does not honour its timeout when
+    # no events arrive, so it cannot live on the main thread: Python only runs
+    # signal handlers there, and only between bytecodes. Park it in a daemon
+    # thread and let the main thread wait for the signal.
+    done = threading.Event()
+
+    def pump():
+        while not done.is_set():
+            try:
+                card.handle_events(500)
+            except Exception:
+                if not done.is_set():
+                    raise
+                return
+
+    threading.Thread(target=pump, daemon=True).start()
+
+    signal.signal(signal.SIGTERM, lambda *_: done.set())
+    signal.signal(signal.SIGINT, lambda *_: done.set())
+    done.wait()
+
+    card.disconnect()
+    print("evdi disconnected", flush=True)
+    # The pump thread is still parked in drm_read() and will never return, so
+    # skip interpreter shutdown rather than hang waiting to join it.
+    sys.stdout.flush()
+    os._exit(0)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

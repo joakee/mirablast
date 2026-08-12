@@ -1,0 +1,83 @@
+# Maintainer: Mark Wagie <mark dot wagie at proton dot me>
+pkgname=gnome-network-displays-git
+pkgver=0.99.0.r11.gc06c561
+pkgrel=1
+pkgdesc="Screencasting for GNOME. Supports the Miracast and Chromecast protocols."
+arch=('x86_64')
+url="https://gitlab.gnome.org/GNOME/gnome-network-displays"
+license=('GPL-3.0-or-later')
+depends=(
+  'avahi'
+  'dnsmasq'
+  'gst-plugin-pipewire'
+  'gst-plugins-bad'
+  'gst-plugins-good'
+  'gst-plugins-ugly'
+  'gst-rtsp-server'
+  'gstreamer'
+  'gtk4'
+  'json-glib'
+  'libadwaita'
+  'libnm'
+  'libportal'
+  'libportal-gtk4'
+  'libpulse'
+  'libsoup3'
+  'networkmanager'
+  'protobuf-c'
+  'xdg-desktop-portal'
+)
+makedepends=(
+  'git'
+  'glib2-devel'
+  'meson'
+)
+optdepends=('gstreamer-vaapi')
+provides=("${pkgname%-git}")
+conflicts=("${pkgname%-git}")
+source=(
+  'git+https://gitlab.gnome.org/GNOME/gnome-network-displays.git'
+  'gnd-x11-region-crop.patch'
+  'gnd-gop-seconds.patch'
+  'gnd-latency.patch'
+)
+sha256sums=(
+  'SKIP'
+  'SKIP'
+  'SKIP'
+  'SKIP'
+)
+
+pkgver() {
+  cd "${pkgname%-git}"
+  git describe --long --tags --abbrev=7 | sed 's/^v//;s/\([^-]*-g\)/r\1/;s/-/./g'
+}
+
+prepare() {
+  cd "${pkgname%-git}"
+
+  # Remove hardcoded libexec path
+  sed -i 's/libexec/lib/g' src/nd-systemd-helpers.c src/meson.build
+
+  # Crop the X11 fallback capture to $GND_X11_REGION (extended display on XFCE/X11)
+  patch -Np1 -i "$srcdir/gnd-x11-region-crop.patch"
+
+  # Keyframe interval configurable via $GND_GOP_SECONDS (default 1s)
+  patch -Np1 -i "$srcdir/gnd-gop-seconds.patch"
+
+  # Pipeline latency: 100ms default off openh264, $GND_LATENCY_MS to tune
+  patch -Np1 -i "$srcdir/gnd-latency.patch"
+}
+
+build() {
+  arch-meson "${pkgname%-git}" build
+  meson compile -C build
+}
+
+check() {
+  meson test -C build --no-rebuild --print-errorlogs
+}
+
+package() {
+  meson install -C build --no-rebuild --destdir "$pkgdir"
+}

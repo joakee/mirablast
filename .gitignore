@@ -1,0 +1,5 @@
+# makepkg build artifacts, if built in-tree under packaging/
+packaging/src/
+packaging/pkg/
+packaging/*.pkg.tar*
+packaging/.SRCINFO

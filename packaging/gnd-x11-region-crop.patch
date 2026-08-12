@@ -1,0 +1,74 @@
+From: local
+Subject: [PATCH] app: allow cropping the X11 fallback capture to a region
+
+When no ScreenCast portal is available (e.g. an XFCE/X11 session, where
+xdg-desktop-portal-gnome cannot provide screencasting because Mutter is
+not running), gnome-network-displays falls back to a bare ximagesrc that
+grabs the whole root window, so the sink can only ever mirror.
+
+Honour $GND_X11_REGION ("WxH+X+Y") to crop that capture to a sub-region
+of the root window. Combined with a virtual display (evdi, or any real
+second output), this gives a real extended display over Miracast instead
+of a mirror.
+
+XDamage is deliberately left at its default (enabled). Forcing it off
+here made the encoded stream flicker badly and smear the cursor on a real
+Miracast sink, while an identical uncropped capture was clean; the full
+frame reads interact badly with the rest of the pipeline. $GND_X11_DAMAGE=0
+disables it for anyone who wants to experiment.
+
+--- a/src/app/nd-window.c
++++ b/src/app/nd-window.c
+@@ -16,6 +16,8 @@
+  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+  */
+
++#include <stdio.h>
++
+ #include <glib/gi18n.h>
+ #include <gst/base/base.h>
+ #include <gst/gst.h>
+@@ -153,8 +155,41 @@ sink_create_source_cb (NdWindow * self, NdSink * sink)
+   bin = GST_BIN (gst_bin_new ("screencast source bin"));
+   g_debug ("use x11: %d", self->use_x11);
+   if (self->use_x11)
+-    src = gst_element_factory_make ("ximagesrc", "X11 screencast source");
+-  else
++    {
++      const gchar *region = g_getenv ("GND_X11_REGION");
++
++      src = gst_element_factory_make ("ximagesrc", "X11 screencast source");
++
++      if (src && region && *region)
++        {
++          guint w = 0, h = 0, x = 0, y = 0;
++
++          if (sscanf (region, "%ux%u+%u+%u", &w, &h, &x, &y) == 4 && w > 0 && h > 0)
++            {
++              g_message ("GND_X11_REGION: cropping X11 capture to %ux%u+%u+%u", w, h, x, y);
++              g_object_set (src,
++                            "startx", x,
++                            "starty", y,
++                            "endx", x + w - 1,
++                            "endy", y + h - 1,
++                            NULL);
++
++              /* Leave XDamage enabled: forcing full-frame reads here made the
++               * stream flicker and smear the cursor on a real sink. */
++              if (g_strcmp0 (g_getenv ("GND_X11_DAMAGE"), "0") == 0)
++                {
++                  g_message ("GND_X11_DAMAGE=0: disabling XDamage");
++                  g_object_set (src, "use-damage", FALSE, NULL);
++                }
++            }
++          else
++            {
++              g_warning ("GND_X11_REGION is set but is not of the form WxH+X+Y "
++                         "(got \"%s\"), capturing the whole screen instead", region);
++            }
++        }
++    }
++  else
+     src = nd_window_screencast_get_source (self);
+
+   if (!src)
