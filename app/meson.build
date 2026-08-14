@@ -55,6 +55,7 @@ vendor_lib = static_library('gnd-backend',
 
 app_sources = files(
   'src/main.c',
+  'src/mb-about-dialog.c',
   'src/mb-session.c',
   'src/mb-settings-dialog.c',
   'src/mb-settings.c',
@@ -63,6 +64,7 @@ app_sources = files(
 
 executable('mirablast-app',
   app_sources,
+  c_args: ['-DMIRABLAST_VERSION="' + meson.project_version() + '"'],
   include_directories: [vendor_inc],
   link_with: vendor_lib,
   dependencies: [gtk_dep, indicator_dep, glib_dep, gio_unix_dep, nm_dep,

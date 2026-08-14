@@ -102,6 +102,7 @@ installed). it has no main window — everything hangs off the tray icon:
 | `Disconnect`                           | stop streaming, keep the virtual display up                                       |
 | `Start` / `Stop virtual display`       | one entry that toggles: spawn the evdi helper and place the output right of primary, or tear it back down |
 | `Settings…`                            | the settings dialog below                                                         |
+| `About`                                | small about window — version, licence, credits                                    |
 | `Quit`                                 | tears the display down on the way out                                             |
 
 the output appears in `xrandr`, `arandr`, and `xfce4-display-settings` as a

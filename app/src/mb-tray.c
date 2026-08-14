@@ -4,6 +4,7 @@
  */
 
 #include "mb-tray.h"
+#include "mb-about-dialog.h"
 #include "mb-settings-dialog.h"
 #include "nd-provider.h"
 
@@ -128,6 +129,12 @@ settings_activate_cb (GtkMenuItem *item, gpointer user_data)
   MbTray *self = MB_TRAY (user_data);
 
   mb_settings_dialog_show (self->settings);
+}
+
+static void
+about_activate_cb (GtkMenuItem *item, gpointer user_data)
+{
+  mb_about_dialog_show ();
 }
 
 static void
@@ -282,6 +289,10 @@ mb_tray_new (GtkApplication *app, MbSession *session, MbSettings *settings)
 
   item = gtk_menu_item_new_with_label ("Settings…");
   g_signal_connect (item, "activate", G_CALLBACK (settings_activate_cb), self);
+  gtk_menu_shell_append (GTK_MENU_SHELL (self->menu), item);
+
+  item = gtk_menu_item_new_with_label ("About");
+  g_signal_connect (item, "activate", G_CALLBACK (about_activate_cb), self);
   gtk_menu_shell_append (GTK_MENU_SHELL (self->menu), item);
 
   item = gtk_menu_item_new_with_label ("Quit");
