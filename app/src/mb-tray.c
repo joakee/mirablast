@@ -5,7 +5,7 @@
 
 #include "mb-tray.h"
 #include "mb-settings-dialog.h"
-#include "mb-sink-window.h"
+#include "nd-provider.h"
 
 #include <libayatana-appindicator/app-indicator.h>
 
@@ -21,31 +21,85 @@ struct _MbTray
   GtkWidget      *menu;
   GtkWidget      *status_item;
   GtkWidget      *cast_item;
+  GtkWidget      *cast_menu;      /* submenu of discovered sinks */
+  GtkWidget      *cast_empty;     /* placeholder shown while it has none */
   GtkWidget      *disconnect_item;
   GtkWidget      *display_item;
-
-  MbSinkWindow   *sink_window;
 };
 
 G_DEFINE_TYPE (MbTray, mb_tray, G_TYPE_OBJECT)
 
+/* ------------------------------------------------------------------ */
+/* the sink submenu                                                    */
+
 static void
-cast_activate_cb (GtkMenuItem *item, gpointer user_data)
+sink_activate_cb (GtkMenuItem *item, gpointer user_data)
 {
   MbTray *self = MB_TRAY (user_data);
-  MbSessionState state = mb_session_get_state (self->session);
+  NdSink *sink = g_object_get_data (G_OBJECT (item), "mb-sink");
 
-  if (state == MB_SESSION_STATE_IDLE || state == MB_SESSION_STATE_ERROR)
-    mb_session_display_start (self->session);
+  if (!sink)
+    return;
 
-  if (!self->sink_window)
+  /* Brings the virtual display up first if it isn't already; the session
+   * queues the connect until the output is ready. */
+  mb_session_connect_sink (self->session, sink);
+}
+
+/* The placeholder keeps the submenu non-empty: an item libdbusmenu has
+ * exported with no children is not drawn as a submenu at all, so the entry
+ * would be dead until the first sink turned up. */
+static void
+update_placeholder (MbTray *self)
+{
+  g_autoptr(GList) children = gtk_container_get_children (GTK_CONTAINER (self->cast_menu));
+  gboolean have_sink = FALSE;
+
+  for (GList *l = children; l; l = l->next)
+    if (l->data != self->cast_empty)
+      {
+        have_sink = TRUE;
+        break;
+      }
+
+  gtk_widget_set_visible (self->cast_empty, !have_sink);
+}
+
+static void
+sink_added_cb (MbTray *self, NdSink *sink, NdProvider *provider)
+{
+  GtkWidget *item;
+  g_autofree gchar *name = NULL;
+
+  g_object_get (sink, "display-name", &name, NULL);
+
+  item = gtk_menu_item_new_with_label (name ? name : "(unnamed sink)");
+  g_object_set_data_full (G_OBJECT (item), "mb-sink",
+                          g_object_ref (sink), g_object_unref);
+  /* Follow renames (the name can arrive after discovery). */
+  g_object_bind_property (sink, "display-name", item, "label",
+                          G_BINDING_DEFAULT);
+  g_signal_connect (item, "activate", G_CALLBACK (sink_activate_cb), self);
+
+  gtk_widget_show (item);
+  gtk_menu_shell_append (GTK_MENU_SHELL (self->cast_menu), item);
+  update_placeholder (self);
+}
+
+static void
+sink_removed_cb (MbTray *self, NdSink *sink, NdProvider *provider)
+{
+  g_autoptr(GList) children = gtk_container_get_children (GTK_CONTAINER (self->cast_menu));
+
+  for (GList *l = children; l; l = l->next)
     {
-      self->sink_window = mb_sink_window_new (self->session);
-      gtk_application_add_window (self->app, GTK_WINDOW (self->sink_window));
-      g_object_add_weak_pointer (G_OBJECT (self->sink_window),
-                                 (gpointer *) &self->sink_window);
+      if (g_object_get_data (G_OBJECT (l->data), "mb-sink") == sink)
+        {
+          gtk_widget_destroy (GTK_WIDGET (l->data));
+          break;
+        }
     }
-  gtk_window_present (GTK_WINDOW (self->sink_window));
+  update_placeholder (self);
 }
 
 static void
@@ -98,6 +152,12 @@ update_cb (MbTray *self, MbSession *session)
   gtk_widget_set_sensitive (self->disconnect_item,
                             state == MB_SESSION_STATE_STREAMING ||
                             state == MB_SESSION_STATE_CONNECTING);
+
+  /* Picking a second sink mid-cast is refused by the session, and discovery
+   * is off while a connect is in flight, so the list is stale then anyway. */
+  gtk_widget_set_sensitive (self->cast_item,
+                            state != MB_SESSION_STATE_STREAMING &&
+                            state != MB_SESSION_STATE_CONNECTING);
 
   switch (state)
     {
@@ -181,10 +241,30 @@ mb_tray_new (GtkApplication *app, MbSession *session, MbSettings *settings)
   gtk_menu_shell_append (GTK_MENU_SHELL (self->menu),
                          gtk_separator_menu_item_new ());
 
-  self->cast_item = gtk_menu_item_new_with_label ("Cast to…");
-  g_signal_connect (self->cast_item, "activate",
-                    G_CALLBACK (cast_activate_cb), self);
+  /* Cast to > <sink>: a submenu rather than a window, kept in step with the
+   * provider so it is right whenever the tray menu is opened. */
+  self->cast_item = gtk_menu_item_new_with_label ("Cast to");
+  self->cast_menu = gtk_menu_new ();
+  self->cast_empty = gtk_menu_item_new_with_label ("Searching for sinks…");
+  gtk_widget_set_sensitive (self->cast_empty, FALSE);
+  gtk_widget_show (self->cast_empty);
+  gtk_menu_shell_append (GTK_MENU_SHELL (self->cast_menu), self->cast_empty);
+  gtk_widget_show (self->cast_menu);
+  gtk_menu_item_set_submenu (GTK_MENU_ITEM (self->cast_item), self->cast_menu);
   gtk_menu_shell_append (GTK_MENU_SHELL (self->menu), self->cast_item);
+
+  {
+    NdMetaProvider *provider = mb_session_get_provider (session);
+    g_autoptr(GList) sinks = nd_provider_get_sinks (ND_PROVIDER (provider));
+
+    g_signal_connect_object (provider, "sink-added",
+                             (GCallback) sink_added_cb, self, G_CONNECT_SWAPPED);
+    g_signal_connect_object (provider, "sink-removed",
+                             (GCallback) sink_removed_cb, self, G_CONNECT_SWAPPED);
+
+    for (GList *l = sinks; l; l = l->next)
+      sink_added_cb (self, l->data, ND_PROVIDER (provider));
+  }
 
   self->disconnect_item = gtk_menu_item_new_with_label ("Disconnect");
   gtk_widget_set_sensitive (self->disconnect_item, FALSE);
@@ -209,6 +289,8 @@ mb_tray_new (GtkApplication *app, MbSession *session, MbSettings *settings)
   gtk_menu_shell_append (GTK_MENU_SHELL (self->menu), item);
 
   gtk_widget_show_all (self->menu);
+  /* show_all does not descend into submenus; their items show themselves. */
+  update_placeholder (self);
   app_indicator_set_menu (self->indicator, GTK_MENU (self->menu));
 
   g_signal_connect_object (session, "state-changed",

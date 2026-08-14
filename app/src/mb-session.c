@@ -57,6 +57,7 @@ struct _MbSession
   /* streaming */
   NdSink             *stream_sink;   /* the running (underlying) sink */
   NdSink             *connect_sink;  /* what was picked from the list */
+  NdSink             *pending_sink;  /* picked before the display was up */
   GstElement         *capture_src;   /* weak */
   guint               exp_w, exp_h;  /* capture size fixed at connect */
   gchar              *warned_region; /* last region we warned about */
@@ -83,6 +84,7 @@ enum {
 static guint signals[N_SIGNALS];
 
 static void mb_session_do_connect (MbSession *self, NdSink *sink);
+static void connect_pending (MbSession *self);
 
 /* ------------------------------------------------------------------ */
 /* helpers                                                             */
@@ -96,6 +98,11 @@ set_state (MbSession *self, MbSessionState state, const gchar *error_message)
   self->state = state;
   g_free (self->error_message);
   self->error_message = g_strdup (error_message);
+
+  /* A queued pick only survives while the display is on its way up. */
+  if (state == MB_SESSION_STATE_ERROR)
+    g_clear_object (&self->pending_sink);
+
   {
     static const gchar *names[] = { "idle", "display-starting", "display-ready",
                                     "connecting", "streaming", "error" };
@@ -371,6 +378,7 @@ startup_tick_cb (gpointer user_data)
           if (self->geom_id == 0)
             self->geom_id = g_timeout_add (GEOM_WATCH_MS, geom_watch_cb, self);
           self->startup_id = 0;
+          connect_pending (self);
           return G_SOURCE_REMOVE;
         }
       return G_SOURCE_CONTINUE;
@@ -466,6 +474,7 @@ mb_session_display_start (MbSession *self)
       g_message ("MbSession: display %s already up, recovering from error state",
                  self->output);
       set_state (self, MB_SESSION_STATE_DISPLAY_READY, NULL);
+      connect_pending (self);
       return;
     }
 
@@ -535,6 +544,7 @@ void
 mb_session_display_stop (MbSession *self)
 {
   mb_session_disconnect (self);
+  g_clear_object (&self->pending_sink);
 
   g_clear_handle_id (&self->startup_id, g_source_remove);
   g_clear_handle_id (&self->geom_id, g_source_remove);
@@ -971,6 +981,20 @@ mb_session_do_connect (MbSession *self, NdSink *sink)
   sink_notify_state_cb (self, NULL, self->stream_sink);
 }
 
+/* Picked from the tray before the display existed: the connect was deferred
+ * to whichever code path brings the output up. */
+static void
+connect_pending (MbSession *self)
+{
+  g_autoptr(NdSink) sink = g_steal_pointer (&self->pending_sink);
+
+  if (!sink || self->stream_sink || !self->output)
+    return;
+
+  g_message ("MbSession: display is ready, connecting to the queued sink");
+  mb_session_connect_sink (self, sink);
+}
+
 void
 mb_session_connect_sink (MbSession *self, NdSink *sink)
 {
@@ -980,9 +1004,18 @@ mb_session_connect_sink (MbSession *self, NdSink *sink)
       return;
     }
 
+  /* The sink list is reachable from the tray whether or not the display is
+   * running, so a pick doubles as "start the display, then cast to this".
+   * Nothing else may be queued: the pick is dropped on error or on stop. */
   if (!self->output)
     {
-      g_warning ("MbSession: virtual display is not up yet");
+      g_set_object (&self->pending_sink, sink);
+
+      if (self->state == MB_SESSION_STATE_IDLE ||
+          self->state == MB_SESSION_STATE_ERROR)
+        mb_session_display_start (self);
+      else
+        g_message ("MbSession: display still starting, queueing the connect");
       return;
     }
 
@@ -1025,6 +1058,14 @@ mb_session_dup_status (MbSession *self)
     case MB_SESSION_STATE_IDLE:
       return g_strdup ("Idle");
     case MB_SESSION_STATE_DISPLAY_STARTING:
+      if (self->pending_sink)
+        {
+          g_autofree gchar *name = NULL;
+
+          g_object_get (self->pending_sink, "display-name", &name, NULL);
+          return g_strdup_printf ("Starting virtual display, then casting to %s…",
+                                  name ? name : "sink");
+        }
       return g_strdup ("Starting virtual display…");
     case MB_SESSION_STATE_DISPLAY_READY:
       return g_strdup_printf ("Display %s ready — not casting",
@@ -1082,6 +1123,7 @@ mb_session_dispose (GObject *object)
     }
 
   g_clear_object (&self->connect_sink);
+  g_clear_object (&self->pending_sink);
   g_clear_object (&self->nm_registry);
   g_clear_object (&self->dummy_provider);
   g_clear_object (&self->meta_provider);

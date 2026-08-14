@@ -98,7 +98,7 @@ installed). it has no main window — everything hangs off the tray icon:
 | menu entry                             | action                                                                        |
 |----------------------------------------|---------------------------------------------------------------------------------|
 | *(top line)*                           | current status; not clickable                                                     |
-| `Cast to…`                             | list discovered sinks; clicking one connects and starts streaming. brings the virtual display up first if it isn't already, so this alone is enough to go from nothing to casting |
+| `Cast to` ▸                            | flyout submenu of every discovered sink, kept live as they come and go; clicking one connects and starts streaming. brings the virtual display up first if it isn't already (the connect is queued until the output is ready), so this alone is enough to go from nothing to casting. greyed out while connecting or casting — disconnect first |
 | `Disconnect`                           | stop streaming, keep the virtual display up                                       |
 | `Start` / `Stop virtual display`       | one entry that toggles: spawn the evdi helper and place the output right of primary, or tear it back down |
 | `Settings…`                            | the settings dialog below                                                         |

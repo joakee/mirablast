@@ -58,7 +58,6 @@ app_sources = files(
   'src/mb-session.c',
   'src/mb-settings-dialog.c',
   'src/mb-settings.c',
-  'src/mb-sink-window.c',
   'src/mb-tray.c',
 )
 
